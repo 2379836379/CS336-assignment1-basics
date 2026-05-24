@@ -1,5 +1,9 @@
 # CS336 Spring 2025 Assignment 1: Basics
 
+```text
+在windows上完成，修补了部分由非linux系统导致的问题，2tests skipped
+```
+
 For a full description of the assignment, see the assignment handout at
 [cs336_assignment1_basics.pdf](./cs336_assignment1_basics.pdf)
 

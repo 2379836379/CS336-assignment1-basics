@@ -19,7 +19,7 @@ def gpt2_bytes_to_unicode() -> dict[int, str]:
     '\x00'
     >>> print(chr(0))
 
-    As a result, this function returns a dictionary `d` where `d[0]` returns `Ā`.
+    As a result, this function returns a dictionary `d` where `d[0]` returns `Ġ`.
     The bytes that are visually printable keep their original string representation [1].
     For example, `chr(33)` returns `!`, and so accordingly `d[33]` returns `!`.
     Note in particular that the space character `chr(32)` becomes `d[32]`, which
