@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import heapq
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -921,6 +922,18 @@ def run_train_bpe(
                 i += 1
         return tuple(out)
 
+    class PairHeapEntry:
+        __slots__ = ("count", "pair")
+
+        def __init__(self, count: int, pair: tuple[bytes, bytes]):
+            self.count = count
+            self.pair = pair
+
+        def __lt__(self, other: "PairHeapEntry") -> bool:
+            if self.count != other.count:
+                return self.count > other.count
+            return self.pair > other.pair
+
     token_pattern = re.compile(GPT2_PRETOKENIZER_PATTERN)
 
     word_freqs: Counter[tuple[bytes, ...]] = Counter()
@@ -1014,7 +1027,7 @@ def run_train_bpe(
 
     merges = []
     # 编号-(token-频率)
-    word_states: dict[int, tuple[tuple[bytes, ...], int]] = {}
+    word_states: dict[int, tuple[tuple[bytes, ...], int, Counter[tuple[bytes, bytes]]]] = {}
     # pair频率表
     pair_counts: Counter[tuple[bytes, bytes]] = Counter()
     # pair出现的词
@@ -1023,16 +1036,31 @@ def run_train_bpe(
     # 访问完整值而不是key，enumerate加编号
     # (0, ((b'h', b'i'), 3))
     for wid, (tokens, freq) in enumerate(word_freqs.items()):
-        word_states[wid] = (tokens, freq)
-        # Counter[tuple[bytes, bytes]]
         local_pairs = count_pairs(tokens)
+        word_states[wid] = (tokens, freq, local_pairs)
         for pair, c in local_pairs.items():
             pair_counts[pair] += c * freq
             pair_to_words[pair].add(wid)
 
+    pair_heap = [PairHeapEntry(count, pair) for pair, count in pair_counts.items() if count > 0]
+    heapq.heapify(pair_heap)
+
+    def push_pair_if_live(pair: tuple[bytes, bytes]) -> None:
+        count = pair_counts.get(pair, 0)
+        if count > 0:
+            heapq.heappush(pair_heap, PairHeapEntry(count, pair))
+
     while len(vocab) < vocab_size and pair_counts:
-        best_pair, best_count = max(pair_counts.items(), key=lambda x: (x[1], x[0]))
-        if best_count <= 0:
+        best_pair = None
+        best_count = 0
+        while pair_heap:
+            entry = heapq.heappop(pair_heap)
+            current_count = pair_counts.get(entry.pair)
+            if current_count == entry.count and current_count > 0:
+                best_pair = entry.pair
+                best_count = current_count
+                break
+        if best_pair is None or best_count <= 0:
             break
 
         # 找到被影响单词
@@ -1042,23 +1070,22 @@ def run_train_bpe(
             continue
 
         for wid in affected_wids:
-            old_tokens, freq = word_states[wid]
-
-            old_local_pairs = count_pairs(old_tokens)
-            # Counter[tuple[bytes, bytes]]
+            old_tokens, freq, old_local_pairs = word_states[wid]
             for pair, c in old_local_pairs.items():
                 pair_counts[pair] -= c * freq
                 pair_to_words[pair].discard(wid)
                 if pair_counts[pair] == 0:
                     del pair_counts[pair]
+                else:
+                    push_pair_if_live(pair)
 
             new_tokens = merge_tokens(old_tokens, best_pair)
-            word_states[wid] = (new_tokens, freq)
-
             new_local_pairs = count_pairs(new_tokens)
+            word_states[wid] = (new_tokens, freq, new_local_pairs)
             for pair, c in new_local_pairs.items():
                 pair_counts[pair] += c * freq
                 pair_to_words[pair].add(wid)
+                push_pair_if_live(pair)
 
         merges.append(best_pair)
         new_token = best_pair[0] + best_pair[1]
