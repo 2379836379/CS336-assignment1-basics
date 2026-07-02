@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import heapq
+import multiprocessing as mp
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -19,6 +20,71 @@ from collections import Counter
 GPT2_PRETOKENIZER_PATTERN = (
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
+
+
+def _find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+    mini_chunk_size = 4096
+
+    for boundary_index in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[boundary_index]
+        file.seek(initial_position)
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+            if mini_chunk == b"":
+                chunk_boundaries[boundary_index] = file_size
+                break
+
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[boundary_index] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    return sorted(set(chunk_boundaries))
+
+
+def _count_pretokens_in_text(text: str, special_tokens: tuple[str, ...]) -> Counter[bytes]:
+    counts: Counter[bytes] = Counter()
+    if not text:
+        return counts
+
+    token_pattern = re.compile(GPT2_PRETOKENIZER_PATTERN)
+    segments = [text]
+    if len(special_tokens) == 1:
+        segments = text.split(special_tokens[0])
+    elif special_tokens:
+        escaped_tokens = sorted((re.escape(tok) for tok in special_tokens), key=len, reverse=True)
+        segments = re.compile("|".join(escaped_tokens)).split(text)
+
+    for segment in segments:
+        if not segment:
+            continue
+        for match in token_pattern.finditer(segment):
+            counts[match.group(0).encode("utf-8")] += 1
+    return counts
+
+
+def _count_pretokens_in_file_chunk(
+    args: tuple[str | os.PathLike, int, int, tuple[str, ...]],
+) -> Counter[bytes]:
+    input_path, start, end, special_tokens = args
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        text = f.read(end - start).decode("utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n")
+    return _count_pretokens_in_text(text, special_tokens)
 
 
 def run_linear(
@@ -898,143 +964,212 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    # "cat" -> (b'c', b'a', b't')
-    def word_to_tokens(word: str) -> tuple[bytes, ...]:
-        return tuple(bytes([b]) for b in word.encode("utf-8"))
-    # 计数
-    def count_pairs(tokens: tuple[bytes, ...]) -> Counter[tuple[bytes, bytes]]:
-        counts = Counter()
+    vocab_items = [tok.encode("utf-8") for tok in special_tokens]
+    byte_symbol_offset = len(vocab_items)
+    vocab_items.extend(bytes([byte_value]) for byte_value in range(256))
+    token_to_symbol = {token: idx for idx, token in enumerate(vocab_items)}
+
+    def word_to_tokens(word: str) -> tuple[int, ...]:
+        return tuple(byte_symbol_offset + byte_value for byte_value in word.encode("utf-8"))
+
+    def token_bytes_to_symbols(token_bytes: bytes) -> tuple[int, ...]:
+        return tuple(byte_symbol_offset + byte_value for byte_value in token_bytes)
+
+    def count_pairs(tokens: tuple[int, ...]) -> Counter[tuple[int, int]]:
+        counts: Counter[tuple[int, int]] = Counter()
         for i in range(len(tokens) - 1):
             counts[(tokens[i], tokens[i + 1])] += 1
         return counts
-    # 合并
-    def merge_tokens(tokens: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
-        a, b = pair
-        merged = a + b
-        out = []
+
+    def merge_tokens(tokens: tuple[int, ...], pair: tuple[int, int], merged_symbol: int) -> tuple[int, ...]:
+        left, right = pair
+        merged_tokens: list[int] = []
         i = 0
-        while i < len(tokens):
-            if i + 1 < len(tokens) and tokens[i] == a and tokens[i + 1] == b:
-                out.append(merged)
+        token_count = len(tokens)
+        while i < token_count:
+            if i + 1 < token_count and tokens[i] == left and tokens[i + 1] == right:
+                merged_tokens.append(merged_symbol)
                 i += 2
             else:
-                out.append(tokens[i])
+                merged_tokens.append(tokens[i])
                 i += 1
-        return tuple(out)
+        return tuple(merged_tokens)
 
     class PairHeapEntry:
-        __slots__ = ("count", "pair")
+        __slots__ = ("count", "pair", "left_bytes", "right_bytes")
 
-        def __init__(self, count: int, pair: tuple[bytes, bytes]):
+        def __init__(self, count: int, pair: tuple[int, int]):
             self.count = count
             self.pair = pair
+            self.left_bytes = vocab_items[pair[0]]
+            self.right_bytes = vocab_items[pair[1]]
 
         def __lt__(self, other: "PairHeapEntry") -> bool:
             if self.count != other.count:
                 return self.count > other.count
-            return self.pair > other.pair
+            if self.left_bytes != other.left_bytes:
+                return self.left_bytes > other.left_bytes
+            return self.right_bytes > other.right_bytes
 
     token_pattern = re.compile(GPT2_PRETOKENIZER_PATTERN)
-
-    word_freqs: Counter[tuple[bytes, ...]] = Counter()
-    pretoken_buffer = ""
-
-    def update_word_freqs(chunk: str) -> None:
-        if not chunk:
-            return
-        to_tokens = word_to_tokens
-        for piece in re.findall(GPT2_PRETOKENIZER_PATTERN, chunk):
-            word_freqs[to_tokens(piece)] += 1
-
-    def consume_pretokens(text: str, final: bool = False) -> None:
-        nonlocal pretoken_buffer
-        if text:
-            pretoken_buffer += text
-        if not pretoken_buffer:
-            return
-        to_tokens = word_to_tokens
-        matches = list(token_pattern.finditer(pretoken_buffer))
-        if not matches:
-            return
-
-        if final:
-            for match in matches:
-                word_freqs[to_tokens(match.group(0))] += 1
-            pretoken_buffer = ""
-            return
-
-        for match in matches[:-1]:
-            word_freqs[to_tokens(match.group(0))] += 1
-        pretoken_buffer = pretoken_buffer[matches[-1].start() :]
-
+    word_freqs: Counter[tuple[int, ...]] = Counter()
     flush_threshold = 1 << 20
-    text_buffer = ""
 
-    def append_text(text: str) -> None:
-        nonlocal text_buffer
-        if not text:
-            return
-        text_buffer += text
-        while len(text_buffer) >= flush_threshold:
-            consume_pretokens(text_buffer[:flush_threshold])
-            text_buffer = text_buffer[flush_threshold:]
+    def add_pretoken_counts(pretoken_counts: Counter[bytes]) -> None:
+        for token_bytes, freq in pretoken_counts.items():
+            word_freqs[token_bytes_to_symbols(token_bytes)] += freq
 
-    with open(input_path, "r", encoding="utf-8") as f:
-        if not special_tokens:
-            while True:
-                chunk = f.read(flush_threshold)
-                if not chunk:
-                    break
-                append_text(chunk)
+    num_processes = kwargs.get("num_processes")
+    if num_processes is None:
+        num_processes = min(os.cpu_count() or 1, 4)
+
+    use_parallel_pretokenization = False
+    try:
+        file_size = os.path.getsize(input_path)
+        use_parallel_pretokenization = (
+            len(special_tokens) == 1
+            and num_processes > 1
+            and file_size >= (2 << 20)
+        )
+    except OSError:
+        file_size = 0
+
+    if use_parallel_pretokenization:
+        split_special_token = special_tokens[0].encode("utf-8")
+        with open(input_path, "rb") as f:
+            boundaries = _find_chunk_boundaries(f, num_processes, split_special_token)
+
+        chunk_args = [
+            (input_path, start, end, tuple(special_tokens))
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+            if end > start
+        ]
+
+        if len(chunk_args) <= 1:
+            use_parallel_pretokenization = False
         else:
-            text = f.read()
-            if len(special_tokens) == 1:
-                for chunk in text.split(special_tokens[0]):
-                    update_word_freqs(chunk)
-            else:
-                escaped = sorted((re.escape(tok) for tok in special_tokens), key=len, reverse=True)
-                special_pattern = re.compile("|".join(escaped))
-                chunk_start = 0
-                for match in special_pattern.finditer(text):
-                    if chunk_start < match.start():
-                        update_word_freqs(text[chunk_start : match.start()])
-                    chunk_start = match.end()
-                if chunk_start < len(text):
-                    update_word_freqs(text[chunk_start:])
+            ctx = mp.get_context("fork")
+            with ctx.Pool(processes=min(num_processes, len(chunk_args))) as pool:
+                for pretoken_counts in pool.imap_unordered(_count_pretokens_in_file_chunk, chunk_args):
+                    add_pretoken_counts(pretoken_counts)
 
-    if text_buffer:
-        consume_pretokens(text_buffer)
-    if pretoken_buffer:
-        consume_pretokens("", final=True)
-    # 分词计数
-    # ((b'h', b'i'), 3)
+    if not use_parallel_pretokenization:
+        if len(special_tokens) == 1 and 0 < file_size < (2 << 20):
+            with open(input_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            for segment in text.split(special_tokens[0]):
+                for match in token_pattern.finditer(segment):
+                    word_freqs[word_to_tokens(match.group(0))] += 1
+        else:
+            pretoken_buffer = ""
+            text_buffer = ""
 
-    vocab = {}
-    idx = 0
-    # 初始化词汇表 特殊字
-    for tok in special_tokens:
-        vocab[idx] = tok.encode("utf-8")
-        idx += 1
-    
-    # 遍历一个 Counter 默认遍历的是它的 key
-    seen_tokens = set(vocab.values())
-    for byte_value in range(256):
-        token = bytes([byte_value])
-        if token not in seen_tokens:
-            vocab[idx] = token
-            seen_tokens.add(token)
-            idx += 1
+            def consume_pretokens(text: str = "", final: bool = False) -> None:
+                nonlocal pretoken_buffer
+                if text:
+                    pretoken_buffer += text
+                if not pretoken_buffer:
+                    return
 
-    merges = []
-    # 编号-(token-频率)
-    word_states: dict[int, tuple[tuple[bytes, ...], int, Counter[tuple[bytes, bytes]]]] = {}
-    # pair频率表
-    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
-    # pair出现的词
-    pair_to_words: dict[tuple[bytes, bytes], set[int]] = defaultdict(set)
+                previous_match = None
+                for match in token_pattern.finditer(pretoken_buffer):
+                    if previous_match is not None:
+                        word_freqs[word_to_tokens(previous_match.group(0))] += 1
+                    previous_match = match
 
-    # 访问完整值而不是key，enumerate加编号
-    # (0, ((b'h', b'i'), 3))
+                if previous_match is None:
+                    return
+
+                if final:
+                    word_freqs[word_to_tokens(previous_match.group(0))] += 1
+                    pretoken_buffer = ""
+                    return
+
+                pretoken_buffer = pretoken_buffer[previous_match.start() :]
+
+            def append_text(text: str) -> None:
+                nonlocal text_buffer
+                if not text:
+                    return
+                text_buffer += text
+                while len(text_buffer) >= flush_threshold:
+                    consume_pretokens(text_buffer[:flush_threshold])
+                    text_buffer = text_buffer[flush_threshold:]
+
+            def flush_segment_boundary() -> None:
+                nonlocal text_buffer
+                if text_buffer:
+                    consume_pretokens(text_buffer)
+                    text_buffer = ""
+                if pretoken_buffer:
+                    consume_pretokens(final=True)
+
+            with open(input_path, "r", encoding="utf-8") as f:
+                if not special_tokens:
+                    while True:
+                        chunk = f.read(flush_threshold)
+                        if not chunk:
+                            break
+                        append_text(chunk)
+                    flush_segment_boundary()
+                else:
+                    pending_text = ""
+                    if len(special_tokens) == 1:
+                        special_token = special_tokens[0]
+                        special_token_length = len(special_token)
+
+                        while True:
+                            chunk = f.read(flush_threshold)
+                            if not chunk:
+                                break
+                            pending_text += chunk
+
+                            while True:
+                                special_index = pending_text.find(special_token)
+                                if special_index == -1:
+                                    break
+                                append_text(pending_text[:special_index])
+                                flush_segment_boundary()
+                                pending_text = pending_text[special_index + special_token_length :]
+
+                            safe_prefix_length = max(0, len(pending_text) - special_token_length + 1)
+                            if safe_prefix_length > 0:
+                                append_text(pending_text[:safe_prefix_length])
+                                pending_text = pending_text[safe_prefix_length:]
+                    else:
+                        escaped_tokens = sorted((re.escape(tok) for tok in special_tokens), key=len, reverse=True)
+                        special_pattern = re.compile("|".join(escaped_tokens))
+                        max_special_token_length = max(len(tok) for tok in special_tokens)
+
+                        while True:
+                            chunk = f.read(flush_threshold)
+                            if not chunk:
+                                break
+                            pending_text += chunk
+
+                            while True:
+                                special_match = special_pattern.search(pending_text)
+                                if special_match is None:
+                                    break
+                                append_text(pending_text[: special_match.start()])
+                                flush_segment_boundary()
+                                pending_text = pending_text[special_match.end() :]
+
+                            safe_prefix_length = max(0, len(pending_text) - max_special_token_length + 1)
+                            if safe_prefix_length > 0:
+                                append_text(pending_text[:safe_prefix_length])
+                                pending_text = pending_text[safe_prefix_length:]
+
+                    if pending_text:
+                        append_text(pending_text)
+                    flush_segment_boundary()
+
+    merges: list[tuple[bytes, bytes]] = []
+    next_token_id = len(vocab_items)
+    word_states: dict[int, tuple[tuple[int, ...], int, Counter[tuple[int, int]]]] = {}
+    pair_counts: Counter[tuple[int, int]] = Counter()
+    pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)
+
     for wid, (tokens, freq) in enumerate(word_freqs.items()):
         local_pairs = count_pairs(tokens)
         word_states[wid] = (tokens, freq, local_pairs)
@@ -1045,12 +1180,12 @@ def run_train_bpe(
     pair_heap = [PairHeapEntry(count, pair) for pair, count in pair_counts.items() if count > 0]
     heapq.heapify(pair_heap)
 
-    def push_pair_if_live(pair: tuple[bytes, bytes]) -> None:
+    def push_pair_if_live(pair: tuple[int, int]) -> None:
         count = pair_counts.get(pair, 0)
         if count > 0:
             heapq.heappush(pair_heap, PairHeapEntry(count, pair))
 
-    while len(vocab) < vocab_size and pair_counts:
+    while len(vocab_items) < vocab_size and pair_counts:
         best_pair = None
         best_count = 0
         while pair_heap:
@@ -1063,36 +1198,42 @@ def run_train_bpe(
         if best_pair is None or best_count <= 0:
             break
 
-        # 找到被影响单词
         affected_wids = list(pair_to_words[best_pair])
         if not affected_wids:
             del pair_counts[best_pair]
             continue
 
+        merged_token = vocab_items[best_pair[0]] + vocab_items[best_pair[1]]
+        merged_symbol = token_to_symbol.get(merged_token)
+        if merged_symbol is None:
+            merged_symbol = next_token_id
+            next_token_id += 1
+            token_to_symbol[merged_token] = merged_symbol
+            vocab_items.append(merged_token)
+
+        changed_pairs: set[tuple[int, int]] = set()
         for wid in affected_wids:
             old_tokens, freq, old_local_pairs = word_states[wid]
             for pair, c in old_local_pairs.items():
                 pair_counts[pair] -= c * freq
                 pair_to_words[pair].discard(wid)
+                changed_pairs.add(pair)
                 if pair_counts[pair] == 0:
                     del pair_counts[pair]
-                else:
-                    push_pair_if_live(pair)
 
-            new_tokens = merge_tokens(old_tokens, best_pair)
+            new_tokens = merge_tokens(old_tokens, best_pair, merged_symbol)
             new_local_pairs = count_pairs(new_tokens)
             word_states[wid] = (new_tokens, freq, new_local_pairs)
             for pair, c in new_local_pairs.items():
                 pair_counts[pair] += c * freq
                 pair_to_words[pair].add(wid)
-                push_pair_if_live(pair)
+                changed_pairs.add(pair)
 
-        merges.append(best_pair)
-        new_token = best_pair[0] + best_pair[1]
-        if new_token not in seen_tokens:
-            vocab[idx] = new_token
-            seen_tokens.add(new_token)
-            idx += 1
+        for pair in changed_pairs:
+            push_pair_if_live(pair)
 
+        merges.append((vocab_items[best_pair[0]], vocab_items[best_pair[1]]))
+
+    vocab = {idx: token for idx, token in enumerate(vocab_items)}
     return vocab, merges
     raise NotImplementedError
